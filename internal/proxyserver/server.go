@@ -85,32 +85,81 @@ func (s *Server) logRequest(method, target string, status int, duration time.Dur
 
 	ts := time.Now().Format("15:04:05")
 
-	var statusColor, statusReset string
+	var statusColor string
+	var note string
 	switch {
 	case status == 0:
-		statusColor, statusReset = ansiCyan, ansiReset
+		statusColor = ansiCyan
+	case status == 407:
+		statusColor = ansiRed
+		note = "  ⚠  AUTH REFUSÉE — vérifiez vos credentials"
+	case status == 403:
+		statusColor = ansiRed
+		note = "  ⚠  ACCÈS INTERDIT (filtrage)"
 	case status < 300:
-		statusColor, statusReset = ansiGreen, ansiReset
+		statusColor = ansiGreen
 	case status < 400:
-		statusColor, statusReset = ansiYellow, ansiReset
+		statusColor = ansiYellow
 	default:
-		statusColor, statusReset = ansiRed, ansiReset
+		statusColor = ansiRed
 	}
 
 	var statusStr string
 	if status == 0 {
-		statusStr = fmt.Sprintf("%stunnel%s", statusColor, statusReset)
+		statusStr = fmt.Sprintf("%stunnel%s", statusColor, ansiReset)
 	} else {
-		statusStr = fmt.Sprintf("%s%d%s", statusColor, status, statusReset)
+		statusStr = fmt.Sprintf("%s%d%s", statusColor, status, ansiReset)
 	}
 
-	s.logger.Printf("%s%s%s  %-8s %s%-50s%s %s  %s%s%s",
+	s.logger.Printf("%s%s%s  %-8s %s%-50s%s %s  %s%s%s%s",
 		ansiGray, ts, ansiReset,
 		method,
 		ansiBold, target, ansiReset,
 		statusStr,
 		ansiGray, duration.Round(time.Millisecond), ansiReset,
+		note,
 	)
+}
+
+// CheckAuth teste l'authentification contre le proxy upstream sans démarrer le serveur.
+func (s *Server) CheckAuth() error {
+	s.mu.RLock()
+	username := s.username
+	s.mu.RUnlock()
+
+	fmt.Fprintf(os.Stderr, "Test d'authentification...\n")
+	fmt.Fprintf(os.Stderr, "  Upstream : %s\n", s.upstreamAddr)
+	fmt.Fprintf(os.Stderr, "  Utilisateur : %s\n", username)
+
+	upstream, err := net.DialTimeout("tcp", s.upstreamAddr, 5*time.Second)
+	if err != nil {
+		return fmt.Errorf("impossible de joindre %s: %w", s.upstreamAddr, err)
+	}
+	defer upstream.Close()
+
+	// Tente un CONNECT vers un hôte neutre
+	testHost := "detectportal.firefox.com:443"
+	fmt.Fprintf(upstream, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n",
+		testHost, testHost, s.authHeader())
+
+	upstream.SetDeadline(time.Now().Add(5 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(upstream), nil)
+	if err != nil {
+		return fmt.Errorf("pas de réponse du proxy: %w", err)
+	}
+	resp.Body.Close()
+
+	switch resp.StatusCode {
+	case http.StatusOK:
+		fmt.Fprintf(os.Stderr, "%s✓ Authentification OK%s\n", ansiGreen, ansiReset)
+		return nil
+	case http.StatusProxyAuthRequired:
+		return fmt.Errorf("%s✗ Authentification refusée (407) — mauvais user/password%s", ansiRed, ansiReset)
+	case http.StatusForbidden:
+		return fmt.Errorf("%s✗ Accès interdit (403) — compte non autorisé%s", ansiRed, ansiReset)
+	default:
+		return fmt.Errorf("réponse inattendue: %s", resp.Status)
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {

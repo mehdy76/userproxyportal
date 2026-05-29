@@ -16,6 +16,7 @@ import (
 func runProxy() {
 	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
 	debug := fs.Bool("debug", false, "Afficher les requêtes en temps réel")
+	check := fs.Bool("check", false, "Tester l'authentification et quitter")
 	fs.Parse(os.Args[2:])
 
 	cfg, err := config.Load(config.DefaultPath)
@@ -36,6 +37,15 @@ func runProxy() {
 	srv := proxyserver.New(listenAddr, upstreamAddr)
 	srv.SetCredentials(username, password)
 	srv.SetDebug(*debug)
+
+	// Mode vérification : tester l'auth et quitter
+	if *check {
+		if err := srv.CheckAuth(); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
@@ -59,9 +69,10 @@ func runProxy() {
 	}()
 
 	if *debug {
+		fmt.Fprintf(os.Stderr, "Utilisateur : %s\n", username)
 		fmt.Fprintf(os.Stderr, "Mode debug activé\n")
 	}
-	fmt.Fprintf(os.Stderr, "Proxy: %s → %s\n", listenAddr, upstreamAddr)
+	fmt.Fprintf(os.Stderr, "Proxy : %s → %s\n", listenAddr, upstreamAddr)
 
 	if err := srv.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Erreur: %v\n", err)
