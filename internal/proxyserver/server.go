@@ -6,11 +6,25 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	nurl "net/url"
+	"os"
 	"strings"
 	"sync"
+	"time"
+)
+
+// Couleurs ANSI (Linux uniquement)
+const (
+	ansiReset  = "\033[0m"
+	ansiGreen  = "\033[32m"
+	ansiYellow = "\033[33m"
+	ansiRed    = "\033[31m"
+	ansiCyan   = "\033[36m"
+	ansiBold   = "\033[1m"
+	ansiGray   = "\033[90m"
 )
 
 type Server struct {
@@ -21,6 +35,8 @@ type Server struct {
 	username string
 	password string
 
+	debug   bool
+	logger  *log.Logger
 	httpSrv *http.Server
 }
 
@@ -28,6 +44,7 @@ func New(listenAddr, upstreamAddr string) *Server {
 	return &Server{
 		listenAddr:   listenAddr,
 		upstreamAddr: upstreamAddr,
+		logger:       log.New(os.Stderr, "", 0),
 	}
 }
 
@@ -36,6 +53,10 @@ func (s *Server) SetCredentials(username, password string) {
 	defer s.mu.Unlock()
 	s.username = username
 	s.password = password
+}
+
+func (s *Server) SetDebug(enabled bool) {
+	s.debug = enabled
 }
 
 func (s *Server) Start() error {
@@ -55,6 +76,41 @@ func (s *Server) authHeader() string {
 	defer s.mu.RUnlock()
 	raw := s.username + ":" + s.password
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(raw))
+}
+
+func (s *Server) logRequest(method, target string, status int, duration time.Duration) {
+	if !s.debug {
+		return
+	}
+
+	ts := time.Now().Format("15:04:05")
+
+	var statusColor, statusReset string
+	switch {
+	case status == 0:
+		statusColor, statusReset = ansiCyan, ansiReset
+	case status < 300:
+		statusColor, statusReset = ansiGreen, ansiReset
+	case status < 400:
+		statusColor, statusReset = ansiYellow, ansiReset
+	default:
+		statusColor, statusReset = ansiRed, ansiReset
+	}
+
+	var statusStr string
+	if status == 0 {
+		statusStr = fmt.Sprintf("%stunnel%s", statusColor, statusReset)
+	} else {
+		statusStr = fmt.Sprintf("%s%d%s", statusColor, status, statusReset)
+	}
+
+	s.logger.Printf("%s%s%s  %-8s %s%-50s%s %s  %s%s%s",
+		ansiGray, ts, ansiReset,
+		method,
+		ansiBold, target, ansiReset,
+		statusStr,
+		ansiGray, duration.Round(time.Millisecond), ansiReset,
+	)
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -80,6 +136,8 @@ func removeHopByHop(h http.Header) {
 }
 
 func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	outReq := r.Clone(r.Context())
 	outReq.RequestURI = ""
 	removeHopByHop(outReq.Header)
@@ -93,10 +151,13 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	resp, err := transport.RoundTrip(outReq)
 	if err != nil {
+		s.logRequest(r.Method, r.URL.String(), http.StatusBadGateway, time.Since(start))
 		http.Error(w, fmt.Sprintf("upstream: %v", err), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+
+	s.logRequest(r.Method, r.URL.String(), resp.StatusCode, time.Since(start))
 
 	removeHopByHop(resp.Header)
 	for k, vv := range resp.Header {
@@ -109,13 +170,15 @@ func (s *Server) handleHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	upstream, err := net.Dial("tcp", s.upstreamAddr)
 	if err != nil {
+		s.logRequest("CONNECT", r.Host, http.StatusBadGateway, time.Since(start))
 		http.Error(w, fmt.Sprintf("dial upstream: %v", err), http.StatusBadGateway)
 		return
 	}
 
-	// Send CONNECT + auth to upstream proxy
 	fmt.Fprintf(upstream, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n",
 		r.Host, r.Host, s.authHeader())
 
@@ -123,6 +186,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	upstreamResp, err := http.ReadResponse(upstreamBuf, r)
 	if err != nil {
 		upstream.Close()
+		s.logRequest("CONNECT", r.Host, http.StatusBadGateway, time.Since(start))
 		http.Error(w, fmt.Sprintf("upstream response: %v", err), http.StatusBadGateway)
 		return
 	}
@@ -130,6 +194,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	if upstreamResp.StatusCode != http.StatusOK {
 		upstream.Close()
+		s.logRequest("CONNECT", r.Host, upstreamResp.StatusCode, time.Since(start))
 		http.Error(w, fmt.Sprintf("upstream CONNECT: %s", upstreamResp.Status), http.StatusBadGateway)
 		return
 	}
@@ -146,11 +211,13 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Tunnel établi — on logue avec status 0 (tunnel)
+	s.logRequest("CONNECT", r.Host, 0, time.Since(start))
+
 	clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-
 	go func() {
 		defer wg.Done()
 		io.Copy(upstream, clientBuf)
@@ -161,6 +228,5 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		io.Copy(clientConn, upstreamBuf)
 		clientConn.Close()
 	}()
-
 	wg.Wait()
 }

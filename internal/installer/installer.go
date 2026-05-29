@@ -9,10 +9,18 @@ import (
 )
 
 const (
-	BinDir     = "/usr/local/bin"
-	ConfDir    = "/etc/userproxyportal"
-	SystemdDir = "/etc/systemd/user"
+	BinDir  = "/usr/local/bin"
+	ConfDir = "/etc/userproxyportal"
 )
+
+// UserSystemdDir retourne ~/.config/systemd/user/ pour l'utilisateur courant.
+func UserSystemdDir() string {
+	if cfg := os.Getenv("XDG_CONFIG_HOME"); cfg != "" {
+		return filepath.Join(cfg, "systemd", "user")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "systemd", "user")
+}
 
 type ComponentStatus struct {
 	Name      string
@@ -21,9 +29,10 @@ type ComponentStatus struct {
 }
 
 func CheckComponents() []ComponentStatus {
+	svcPath := filepath.Join(UserSystemdDir(), "userproxyportal.service")
 	items := []struct{ name, path string }{
 		{"userproxyportal", BinDir + "/userproxyportal"},
-		{"userproxyportal.service", SystemdDir + "/userproxyportal.service"},
+		{"userproxyportal.service", svcPath},
 		{"config.yaml", ConfDir + "/config.yaml"},
 	}
 	statuses := make([]ComponentStatus, len(items))
@@ -34,14 +43,10 @@ func CheckComponents() []ComponentStatus {
 	return statuses
 }
 
-// SelfInstall copies the running executable and embedded assets via pkexec.
+// SelfInstall installe le binaire et la config via pkexec (root),
+// puis installe le service dans ~/.config/systemd/user/ sans élévation.
 func SelfInstall(exePath string, serviceContent, configContent []byte) error {
-	svcTmp, err := writeTempFile("*.service", serviceContent)
-	if err != nil {
-		return err
-	}
-	defer os.Remove(svcTmp)
-
+	// --- Partie root : binaire + répertoire config ---
 	cfgTmp, err := writeTempFile("*.yaml", configContent)
 	if err != nil {
 		return err
@@ -49,39 +54,50 @@ func SelfInstall(exePath string, serviceContent, configContent []byte) error {
 	defer os.Remove(cfgTmp)
 
 	binDest := BinDir + "/userproxyportal"
-	svcDest := SystemdDir + "/userproxyportal.service"
 	cfgDest := ConfDir + "/config.yaml"
 
-	script := fmt.Sprintf(`set -e
+	rootScript := fmt.Sprintf(`set -e
 cp '%s' '%s' && chmod 755 '%s'
-mkdir -p '%s' && cp '%s' '%s'
 mkdir -p '%s'
 [ -f '%s' ] || cp '%s' '%s'
 `, exePath, binDest, binDest,
-		SystemdDir, svcTmp, svcDest,
 		ConfDir, cfgDest, cfgTmp, cfgDest)
 
-	out, err := exec.Command("pkexec", "sh", "-c", script).CombinedOutput()
+	out, err := exec.Command("pkexec", "sh", "-c", rootScript).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("installation: %w\n%s", err, out)
+		return fmt.Errorf("installation (root): %w\n%s", err, out)
 	}
-	return nil
+
+	// --- Partie utilisateur : fichier service ---
+	svcDir := UserSystemdDir()
+	if err := os.MkdirAll(svcDir, 0755); err != nil {
+		return fmt.Errorf("création %s: %w", svcDir, err)
+	}
+	svcDest := filepath.Join(svcDir, "userproxyportal.service")
+	if err := os.WriteFile(svcDest, serviceContent, 0644); err != nil {
+		return fmt.Errorf("écriture service: %w", err)
+	}
+
+	return DaemonReload()
 }
 
-// Uninstall removes the binary and the service file via pkexec.
+// Uninstall supprime le binaire (root) et le service utilisateur.
 func Uninstall() error {
-	script := fmt.Sprintf(`set -e
-rm -f '%s/userproxyportal'
-rm -f '%s/userproxyportal.service'
-`, BinDir, SystemdDir)
+	// Suppression du binaire via pkexec
+	script := fmt.Sprintf("rm -f '%s/userproxyportal'", BinDir)
 	out, err := exec.Command("pkexec", "sh", "-c", script).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("désinstallation: %w\n%s", err, out)
 	}
+
+	// Suppression du service (utilisateur, pas besoin de root)
+	svcPath := filepath.Join(UserSystemdDir(), "userproxyportal.service")
+	os.Remove(svcPath)
+
 	return nil
 }
 
-// WriteConfig writes config content to /etc/userproxyportal/config.yaml via pkexec.
+// WriteConfig écrit config.yaml dans /etc/userproxyportal/ via pkexec.
 func WriteConfig(content, certPath string) error {
 	cfgTmp, err := writeTempFile("*.yaml", []byte(content))
 	if err != nil {
@@ -112,7 +128,6 @@ func WriteConfig(content, certPath string) error {
 	return nil
 }
 
-// ServiceState holds the current state of the systemd user service.
 type ServiceState struct {
 	Active  bool
 	Enabled bool
@@ -145,10 +160,14 @@ func ServiceControl(action string) error {
 	return nil
 }
 
-// DaemonReload demande au daemon systemd utilisateur de relire ses unités.
-// À appeler après toute installation ou modification de fichier .service.
 func DaemonReload() error {
-	out, err := exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput()
+	// S'assurer que XDG_RUNTIME_DIR est défini pour que systemctl --user fonctionne
+	cmd := exec.Command("systemctl", "--user", "daemon-reload")
+	if os.Getenv("XDG_RUNTIME_DIR") == "" {
+		uid := os.Getuid()
+		cmd.Env = append(os.Environ(), fmt.Sprintf("XDG_RUNTIME_DIR=/run/user/%d", uid))
+	}
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("daemon-reload: %w\n%s", err, out)
 	}

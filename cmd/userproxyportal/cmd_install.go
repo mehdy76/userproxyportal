@@ -22,17 +22,9 @@ func runInstall() {
 	}
 
 	fmt.Println("✓ Binaire installé dans /usr/local/bin/userproxyportal")
-	fmt.Println("✓ Service systemd installé dans /etc/systemd/user/")
+	fmt.Printf("✓ Service installé dans %s\n", installer.UserSystemdDir())
 	fmt.Println("✓ Répertoire de configuration créé dans /etc/userproxyportal/")
-
-	fmt.Print("→ Rechargement du daemon systemd utilisateur... ")
-	if err := installer.DaemonReload(); err != nil {
-		fmt.Fprintf(os.Stderr, "\n⚠ daemon-reload: %v\n", err)
-		fmt.Println("  Lancez manuellement: systemctl --user daemon-reload")
-	} else {
-		fmt.Println("OK")
-	}
-
+	fmt.Println("✓ daemon-reload effectué")
 	fmt.Println()
 	fmt.Println("Étapes suivantes:")
 	fmt.Println("  1. Configurez le proxy:    userproxyportal setup")

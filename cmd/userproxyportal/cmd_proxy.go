@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
@@ -13,6 +14,10 @@ import (
 )
 
 func runProxy() {
+	fs := flag.NewFlagSet("proxy", flag.ExitOnError)
+	debug := fs.Bool("debug", false, "Afficher les requêtes en temps réel")
+	fs.Parse(os.Args[2:])
+
 	cfg, err := config.Load(config.DefaultPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Erreur config: %v\n", err)
@@ -30,6 +35,7 @@ func runProxy() {
 
 	srv := proxyserver.New(listenAddr, upstreamAddr)
 	srv.SetCredentials(username, password)
+	srv.SetDebug(*debug)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGHUP, syscall.SIGTERM, syscall.SIGINT)
@@ -44,7 +50,7 @@ func runProxy() {
 					continue
 				}
 				srv.SetCredentials(u, p)
-				fmt.Println("Credentials rechargés")
+				fmt.Fprintln(os.Stderr, "Credentials rechargés")
 			case syscall.SIGTERM, syscall.SIGINT:
 				srv.Shutdown(context.Background())
 				os.Exit(0)
@@ -52,7 +58,11 @@ func runProxy() {
 		}
 	}()
 
-	fmt.Printf("Proxy local: %s → %s\n", listenAddr, upstreamAddr)
+	if *debug {
+		fmt.Fprintf(os.Stderr, "Mode debug activé\n")
+	}
+	fmt.Fprintf(os.Stderr, "Proxy: %s → %s\n", listenAddr, upstreamAddr)
+
 	if err := srv.Start(); err != nil {
 		fmt.Fprintf(os.Stderr, "Erreur: %v\n", err)
 		os.Exit(1)
