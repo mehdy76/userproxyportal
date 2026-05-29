@@ -1,0 +1,17 @@
+proxy:
+  # Adresse du serveur proxy d'entreprise
+  host: proxy.entreprise.local
+  port: 8080
+
+  # Port d'écoute du proxy local (défaut: 3128)
+  local_port: 3128
+
+  # URL du fichier PAC (optionnel)
+  pac_url: ""
+
+  # Hôtes à exclure du proxy
+  no_proxy: localhost,127.0.0.1,::1,.entreprise.local
+
+certificate:
+  # Chemin vers le certificat d'inspection SSL (.cer ou .crt)
+  path: ""
