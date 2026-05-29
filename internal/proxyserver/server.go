@@ -121,6 +121,33 @@ func (s *Server) logRequest(method, target string, status int, duration time.Dur
 	)
 }
 
+// connectTest envoie un CONNECT au proxy upstream avec ou sans auth et retourne le status code.
+func (s *Server) connectTest(withAuth bool) (int, error) {
+	conn, err := net.DialTimeout("tcp", s.upstreamAddr, 5*time.Second)
+	if err != nil {
+		return 0, fmt.Errorf("impossible de joindre %s: %w", s.upstreamAddr, err)
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	testHost := "example.com:443"
+	if withAuth {
+		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n",
+			testHost, testHost, s.authHeader())
+	} else {
+		fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n",
+			testHost, testHost)
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		return 0, fmt.Errorf("pas de réponse du proxy: %w", err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
 // CheckAuth teste l'authentification contre le proxy upstream sans démarrer le serveur.
 func (s *Server) CheckAuth() error {
 	s.mu.RLock()
@@ -131,34 +158,41 @@ func (s *Server) CheckAuth() error {
 	fmt.Fprintf(os.Stderr, "  Upstream : %s\n", s.upstreamAddr)
 	fmt.Fprintf(os.Stderr, "  Utilisateur : %s\n", username)
 
-	upstream, err := net.DialTimeout("tcp", s.upstreamAddr, 5*time.Second)
+	// Étape 1 : vérifier que le proxy exige bien une auth (sans credentials)
+	fmt.Fprintf(os.Stderr, "  Étape 1/2 : vérification que le proxy exige une auth...\n")
+	status, err := s.connectTest(false)
 	if err != nil {
-		return fmt.Errorf("impossible de joindre %s: %w", s.upstreamAddr, err)
+		return err
 	}
-	defer upstream.Close()
-
-	// Tente un CONNECT vers un hôte neutre
-	testHost := "detectportal.firefox.com:443"
-	fmt.Fprintf(upstream, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n",
-		testHost, testHost, s.authHeader())
-
-	upstream.SetDeadline(time.Now().Add(5 * time.Second))
-	resp, err := http.ReadResponse(bufio.NewReader(upstream), nil)
-	if err != nil {
-		return fmt.Errorf("pas de réponse du proxy: %w", err)
-	}
-	resp.Body.Close()
-
-	switch resp.StatusCode {
+	switch status {
+	case http.StatusProxyAuthRequired:
+		fmt.Fprintf(os.Stderr, "  → 407 reçu sans auth : le proxy exige bien des credentials\n")
 	case http.StatusOK:
-		fmt.Fprintf(os.Stderr, "%s✓ Authentification OK%s\n", ansiGreen, ansiReset)
+		fmt.Fprintf(os.Stderr, "%s⚠  Proxy accessible sans authentification (réseau interne ou IP whitelistée)%s\n", ansiYellow, ansiReset)
+		fmt.Fprintf(os.Stderr, "%s   Impossible de valider les credentials dans ce contexte.%s\n", ansiYellow, ansiReset)
+		return nil
+	case http.StatusForbidden:
+		return fmt.Errorf("%s✗ Accès interdit (403) sans auth — IP bloquée ?%s", ansiRed, ansiReset)
+	default:
+		fmt.Fprintf(os.Stderr, "  → Réponse inattendue sans auth: %d\n", status)
+	}
+
+	// Étape 2 : tester avec les credentials
+	fmt.Fprintf(os.Stderr, "  Étape 2/2 : envoi des credentials...\n")
+	status, err = s.connectTest(true)
+	if err != nil {
+		return err
+	}
+	switch status {
+	case http.StatusOK:
+		fmt.Fprintf(os.Stderr, "%s✓ Authentification OK — credentials acceptés%s\n", ansiGreen, ansiReset)
 		return nil
 	case http.StatusProxyAuthRequired:
 		return fmt.Errorf("%s✗ Authentification refusée (407) — mauvais user/password%s", ansiRed, ansiReset)
 	case http.StatusForbidden:
-		return fmt.Errorf("%s✗ Accès interdit (403) — compte non autorisé%s", ansiRed, ansiReset)
+		return fmt.Errorf("%s✗ Accès interdit (403) — compte non autorisé par le filtrage%s", ansiRed, ansiReset)
 	default:
-		return fmt.Errorf("réponse inattendue: %s", resp.Status)
+		return fmt.Errorf("réponse inattendue avec auth: %d", status)
 	}
 }
 
