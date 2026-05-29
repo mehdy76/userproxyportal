@@ -70,6 +70,8 @@ func makeInstallTab(w fyne.Window) fyne.CanvasObject {
 				setStatus(err.Error(), true)
 				return
 			}
+			// Le service vient d'être copié — le daemon doit relire ses unités
+			installer.DaemonReload()
 			refresh()
 			setStatus("Installation réussie", false)
 		}()

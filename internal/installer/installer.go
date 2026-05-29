@@ -145,6 +145,16 @@ func ServiceControl(action string) error {
 	return nil
 }
 
+// DaemonReload demande au daemon systemd utilisateur de relire ses unités.
+// À appeler après toute installation ou modification de fichier .service.
+func DaemonReload() error {
+	out, err := exec.Command("systemctl", "--user", "daemon-reload").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("daemon-reload: %w\n%s", err, out)
+	}
+	return nil
+}
+
 func writeTempFile(pattern string, content []byte) (string, error) {
 	f, err := os.CreateTemp("", pattern)
 	if err != nil {
